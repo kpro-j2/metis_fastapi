@@ -2,8 +2,13 @@
 from modules.RedisProxy import RedisProxy
 import socket, os
 
+_proxy_by_db = {}
+
 # get redis proxy instance
 def get_redis_proxy(db: int = 0) -> RedisProxy:
+  if db in _proxy_by_db:
+    return _proxy_by_db[db]
+
   redis_host = os.getenv("REDIS_SERVER_HOST", "localhost")
   redis_port = int(os.getenv("REDIS_SERVER_PORT", 6379)) 
   print(f"Connecting to Redis server at {redis_host}:{redis_port}, db={db}")
@@ -18,4 +23,5 @@ def get_redis_proxy(db: int = 0) -> RedisProxy:
   
   aProxy = RedisProxy()
   aProxy.connect(redis_host, redis_port, db)
+  _proxy_by_db[db] = aProxy
   return aProxy
