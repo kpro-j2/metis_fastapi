@@ -1,16 +1,15 @@
 import redis
 from fastapi import APIRouter
 from modules.RedisProxy import RedisProxy
-
+from metis_fastapi.dependencies import get_redis_proxy
 router = APIRouter(
    prefix="/nestdaq",
    tags=["nestdaq"]
 )
 
-aProxy = RedisProxy();
-#aProxy.connect("localhost",6379,0);
-aProxy.connect("vmeserver1-gp",6379,0)
-rcli = aProxy.instance()
+
+
+aProxy = get_redis_proxy(0)
 
 @router.get('/')
 async def root() : 

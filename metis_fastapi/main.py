@@ -1,34 +1,35 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import logging
-
+# import logging
+from metis_fastapi.dependencies import get_redis_proxy
 from modules.RedisProxy import RedisProxy
 from routers import RouterSystemCommand
-from routers import ControlNestDAQ, RouterScaler, ControlBabirl
-
-logging.basicConfig(level=logging.WARNING)
+from routers import RouterScaler
+from routers import ControlNestDAQ
+# logging.basicConfig(level=logging.WARNING)
 app = FastAPI()
 app.include_router(ControlNestDAQ.router)
 app.include_router(RouterSystemCommand.router)
 app.include_router(RouterScaler.router)
-app.include_router(ControlBabirl.router)
+# app.include_router(ControlBabirl.router)
+# 
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,   # 追記により追加
+#     allow_methods=["*"],      # 追記により追加
+#     allow_headers=["*"]       # 追記により追加
+# )
+# 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,   # 追記により追加
-    allow_methods=["*"],      # 追記により追加
-    allow_headers=["*"]       # 追記により追加
-)
-
-aProxy = RedisProxy();
-#aProxy.connect("localhost",6379,0);
-aProxy.connect("vmeserver1-gp",6379,0);
+# get from dependencies.py
+aProxy = get_redis_proxy(0)
 
 @app.get("/")
 async def root():
-    return {"message": aProxy.isConnected()}
+    return {"message": "Hello World"}
+#     return {"message": aProxy.isConnected()}
 @app.get("/set/{key}/{val}")
 async def read_item(key: str, val: str) :
     r = aProxy.instance()
@@ -42,7 +43,7 @@ async def read_item(key: str) :
     if val == None :
         val = ""
     return {"message": val}
-
+ 
 @app.get("/incr/{key}")
 async def read_item(key: str) :
     r = aProxy.instance()
@@ -50,7 +51,7 @@ async def read_item(key: str) :
     if val == None :
         val = ""
     return {"message": val}
-
+ 
 @app.get("/expire/{key}/{time}")
 async def read_item(key: str, time: str) :
     r = aProxy.instance()
@@ -71,5 +72,3 @@ async def read_item(chnl: str, msg: str) :
 @app.get("/items/")
 async def read_item(skip: int = 0, limit: int = 10):
     return JSONResponse(content={"skip":skip, "limit":limit})
-
-#    return {"skip":skip, "limit":limit}
