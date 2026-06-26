@@ -66,13 +66,25 @@ class RPH032:
         self._check_ch(ch)
         self._write16(0x10 + 2 * (ch - 1), volt)
 
+    def read_set_voltage(self, ch: int) -> int:
+        self._check_ch(ch)
+        return self._rbcp_read16(0x10 + 2 * (ch - 1))
+
     def set_current_limit(self, ch: int, limit: int) -> None:
         self._check_ch(ch)
         self._write16(0x20 + 2 * (ch - 1), limit)
 
+    def read_current_limit(self, ch: int) -> int:
+        self._check_ch(ch)
+        return self._rbcp_read16(0x20 + 2 * (ch - 1))
+
     def set_ramp(self, ch: int, ramp: int) -> None:
         self._check_ch(ch)
         self._write8(0x0C + (ch - 1), ramp)
+
+    def read_ramp(self, ch: int) -> int:
+        self._check_ch(ch)
+        return self._rbcp_read16(0x0C + (ch - 1)) & 0xFF
 
     def read_voltage(self, ch: int) -> int:
         self._check_ch(ch)

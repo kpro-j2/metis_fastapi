@@ -1,7 +1,7 @@
 import datetime
 
 import redis
-from fastapi import APIRouter, Path
+from fastapi import APIRouter
 from modules.ScalerFactory import ScalerFactory
 from modules.HulScaler import HulScaler
 

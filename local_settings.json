@@ -1,0 +1,19 @@
+{
+  "rph032_server_config": {
+    "default": {
+      "api_base_uri": "http://172.16.204.221:8000"
+    }
+  },
+  "rph032_target_config": {
+    "hv1": {
+      "ip": "192.168.2.77",
+      "port": 4660,
+      "server_id": "default"
+    },
+    "hv2": {
+      "ip": "192.168.2.78",
+      "port": 4660,
+      "server_id": "default"
+    }
+  }
+}

@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # import logging
 from metis_fastapi.dependencies import get_redis_proxy
 from modules.RedisProxy import RedisProxy
+from modules.local_settings import get_setting, set_setting, get_settings_file_path
 from routers import RouterSystemCommand
 from routers import RouterScaler
 from routers import ControlNestDAQ
@@ -33,11 +34,24 @@ app.add_middleware(
 
 # get from dependencies.py
 aProxy = get_redis_proxy(0)
+saved_redis_cfg = get_setting("redis_config", {})
+if not isinstance(saved_redis_cfg, dict):
+    saved_redis_cfg = {}
 redis_cfg = {
-    "host": os.getenv("REDIS_SERVER_HOST", "localhost"),
-    "port": int(os.getenv("REDIS_SERVER_PORT", "6379")),
-    "db": 0,
+    "host": str(saved_redis_cfg.get("host", os.getenv("REDIS_SERVER_HOST", "localhost"))),
+    "port": int(saved_redis_cfg.get("port", int(os.getenv("REDIS_SERVER_PORT", "6379")))),
+    "db": int(saved_redis_cfg.get("db", 0)),
 }
+
+
+def _normalize_uri(uri: str) -> str:
+    return str(uri or "").strip().rstrip("/")
+
+# Try restoring saved redis endpoint at startup; if unreachable, keep app running.
+try:
+    aProxy.connect(redis_cfg["host"], redis_cfg["port"], redis_cfg["db"])
+except Exception:
+    pass
 
 
 def _redis_instance():
@@ -54,6 +68,7 @@ async def redis_status():
         "host": redis_cfg["host"],
         "port": redis_cfg["port"],
         "db": redis_cfg["db"],
+        "settings_file": get_settings_file_path(),
     }
 
 
@@ -77,12 +92,64 @@ async def redis_config_set(host: str, port: int, db: int):
     redis_cfg["host"] = host
     redis_cfg["port"] = port
     redis_cfg["db"] = db
+    set_setting("redis_config", redis_cfg)
     return {
         "message": "ok" if ok else "failed",
         "connected": bool(ok),
         "host": host,
         "port": port,
         "db": db,
+    }
+
+
+@app.get("/ui/config/get")
+async def ui_config_get():
+    nestdaq_api_uri = _normalize_uri(get_setting("nestdaq_api_uri", ""))
+    scaler_api_uri = _normalize_uri(get_setting("scaler_api_uri", ""))
+    scaler_ips = get_setting("scaler_ips", [])
+    if not isinstance(scaler_ips, list):
+        scaler_ips = []
+    scaler_ips = [str(v).strip() for v in scaler_ips if str(v).strip()]
+    return {
+        "nestdaq_api_uri": nestdaq_api_uri,
+        "scaler_api_uri": scaler_api_uri,
+        "scaler_ips": scaler_ips,
+        "redis": {
+            "host": redis_cfg["host"],
+            "port": redis_cfg["port"],
+            "db": redis_cfg["db"],
+        },
+        "settings_file": get_settings_file_path(),
+    }
+
+
+@app.get("/ui/config/set/nestdaq_api/{api_base_uri:path}")
+async def ui_config_set_nestdaq_api(api_base_uri: str):
+    value = _normalize_uri(api_base_uri)
+    set_setting("nestdaq_api_uri", value)
+    return {
+        "message": "ok",
+        "nestdaq_api_uri": value,
+    }
+
+
+@app.get("/ui/config/set/scaler_api/{api_base_uri:path}")
+async def ui_config_set_scaler_api(api_base_uri: str):
+    value = _normalize_uri(api_base_uri)
+    set_setting("scaler_api_uri", value)
+    return {
+        "message": "ok",
+        "scaler_api_uri": value,
+    }
+
+
+@app.get("/ui/config/set/scaler_ips/{ips:path}")
+async def ui_config_set_scaler_ips(ips: str):
+    values = [v.strip() for v in str(ips or "").split(",") if v.strip()]
+    set_setting("scaler_ips", values)
+    return {
+        "message": "ok",
+        "scaler_ips": values,
     }
 
 @app.get("/")

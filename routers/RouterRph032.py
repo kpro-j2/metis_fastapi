@@ -8,6 +8,7 @@ from typing import Dict, Optional, Tuple, Union
 from fastapi import APIRouter, HTTPException, Query
 
 from modules.device_rph032 import RPH032
+from modules.local_settings import get_setting, set_setting
 
 router = APIRouter(prefix="/rph032", tags=["rph032"])
 
@@ -19,6 +20,62 @@ _cache_lock = threading.Lock()
 _module_cache: Dict[str, Dict[str, Union[float, str, Dict[int, int], None]]] = {}
 _poll_thread: Optional[threading.Thread] = None
 _poll_interval_sec = float(os.environ.get("RPH032_POLL_INTERVAL_SEC", "1.0"))
+
+
+def _persist_settings() -> None:
+    with _target_lock:
+        targets = {k: dict(v) for k, v in _target_config.items()}
+    with _server_lock:
+        servers = {k: dict(v) for k, v in _server_config.items()}
+    set_setting("rph032_target_config", targets)
+    set_setting("rph032_server_config", servers)
+
+
+def _load_settings() -> None:
+    saved_targets = get_setting("rph032_target_config", {})
+    saved_servers = get_setting("rph032_server_config", {})
+
+    if isinstance(saved_servers, dict):
+        with _server_lock:
+            _server_config.clear()
+            _server_config["default"] = {"api_base_uri": ""}
+            for sid, cfg in saved_servers.items():
+                if not isinstance(sid, str) or not sid:
+                    continue
+                if not isinstance(cfg, dict):
+                    continue
+                api_base_uri = str(cfg.get("api_base_uri", "")).rstrip("/")
+                _server_config[sid] = {"api_base_uri": api_base_uri}
+
+    if isinstance(saved_targets, dict):
+        with _target_lock:
+            _target_config.clear()
+            for module, cfg in saved_targets.items():
+                if not isinstance(module, str) or not module:
+                    continue
+                if not isinstance(cfg, dict):
+                    continue
+                ip = cfg.get("ip")
+                port = cfg.get("port")
+                server_id = str(cfg.get("server_id", "default"))
+                if ip is None or port is None:
+                    continue
+                try:
+                    _validate_ip_port(str(ip), int(port))
+                except HTTPException:
+                    continue
+                _target_config[module] = {
+                    "server_id": server_id,
+                    "ip": str(ip),
+                    "port": int(port),
+                }
+
+    with _target_lock:
+        modules = list(_target_config.keys())
+    for module in modules:
+        _init_cache_if_needed(module)
+    if modules:
+        _start_poller_if_needed()
 
 
 def _validate_ip_port(ip: str, port: int) -> None:
@@ -165,29 +222,7 @@ def _start_poller_if_needed() -> None:
             _poll_thread.start()
 
 
-def _get_cached_channel(module: str, ch: int) -> Tuple[int, int, Optional[str], Optional[float]]:
-    if ch < 1 or ch > 4:
-        raise HTTPException(status_code=400, detail="ch must be 1..4")
-
-    with _cache_lock:
-        cached = _module_cache.get(module)
-
-    if cached is None:
-        raise HTTPException(status_code=503, detail=f"no cached data for module '{module}'")
-
-    voltages = cached.get("voltage", {})
-    currents = cached.get("current", {})
-    if not isinstance(voltages, dict) or not isinstance(currents, dict):
-        raise HTTPException(status_code=503, detail=f"invalid cache for module '{module}'")
-
-    if ch not in voltages or ch not in currents:
-        raise HTTPException(status_code=503, detail=f"cached data is not ready for module '{module}'")
-
-    err = cached.get("error")
-    ts = cached.get("timestamp")
-    error = str(err) if err is not None else None
-    timestamp = float(ts) if ts is not None else None
-    return int(voltages[ch]), int(currents[ch]), error, timestamp
+_load_settings()
 
 
 @router.get("/")
@@ -213,6 +248,7 @@ async def config_set(ip: str, port: int):
         _target_config["default"] = {"server_id": "default", "ip": ip, "port": port}
     _init_cache_if_needed("default")
     _refresh_module_cache("default", ip, port)
+    _persist_settings()
     _start_poller_if_needed()
     return {"message": "ok", "module": "default", "ip": ip, "port": port}
 
@@ -224,6 +260,7 @@ async def config_clear():
         _target_config.pop("default", None)
     with _cache_lock:
         _module_cache.pop("default", None)
+    _persist_settings()
     return {"message": "ok", "module": "default", "ip": None, "port": None}
 
 
@@ -293,6 +330,7 @@ async def server_set(server_id: str, api_base_uri: str):
     _validate_api_base_uri(api_base_uri)
     with _server_lock:
         _server_config[server_id] = {"api_base_uri": api_base_uri.rstrip("/")}
+    _persist_settings()
     return {"message": "ok", "server_id": server_id, "api_base_uri": api_base_uri.rstrip("/")}
 
 
@@ -303,6 +341,7 @@ async def server_clear(server_id: str):
         raise HTTPException(status_code=400, detail="default server cannot be removed")
     with _server_lock:
         _server_config.pop(server_id, None)
+    _persist_settings()
     return {"message": "ok", "server_id": server_id}
 
 
@@ -314,6 +353,7 @@ async def config_set_module(module: str, ip: str, port: int):
         _target_config[module] = {"server_id": "default", "ip": ip, "port": port}
     _init_cache_if_needed(module)
     _refresh_module_cache(module, ip, port)
+    _persist_settings()
     _start_poller_if_needed()
     return {"message": "ok", "module": module, "server_id": "default", "ip": ip, "port": port}
 
@@ -330,6 +370,7 @@ async def config_set_module_server(module: str, server_id: str, ip: str, port: i
         _target_config[module] = {"server_id": server_id, "ip": ip, "port": port}
     _init_cache_if_needed(module)
     _refresh_module_cache(module, ip, port)
+    _persist_settings()
     _start_poller_if_needed()
     return {"message": "ok", "module": module, "server_id": server_id, "ip": ip, "port": port}
 
@@ -341,6 +382,7 @@ async def config_clear_module(module: str):
         _target_config.pop(module, None)
     with _cache_lock:
         _module_cache.pop(module, None)
+    _persist_settings()
     return {"message": "ok", "module": module, "ip": None, "port": None}
 
 
@@ -471,21 +513,20 @@ async def readv(
     ip: Optional[str] = Query(default=None),
     port: Optional[int] = Query(default=None),
 ):
+    ctl = _controller(ip, port, module)
     try:
-        if ip is not None and port is not None:
-            _validate_ip_port(ip, port)
-            _init_cache_if_needed(module)
-            _refresh_module_cache(module, ip, port)
-        voltage, _current, error, ts = _get_cached_channel(module, ch)
+        voltage = ctl.read_voltage(ch)
         return {
             "module": module,
             "server_id": _module_server_id(module),
             "api_base_uri": _module_api_base_uri(module),
             "ch": ch,
             "voltage": voltage,
-            "timestamp": ts,
-            "error": error,
+            "timestamp": time.time(),
+            "error": None,
         }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except OSError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
@@ -497,21 +538,20 @@ async def readi(
     ip: Optional[str] = Query(default=None),
     port: Optional[int] = Query(default=None),
 ):
+    ctl = _controller(ip, port, module)
     try:
-        if ip is not None and port is not None:
-            _validate_ip_port(ip, port)
-            _init_cache_if_needed(module)
-            _refresh_module_cache(module, ip, port)
-        _voltage, current, error, ts = _get_cached_channel(module, ch)
+        current = ctl.read_current(ch)
         return {
             "module": module,
             "server_id": _module_server_id(module),
             "api_base_uri": _module_api_base_uri(module),
             "ch": ch,
             "current": current,
-            "timestamp": ts,
-            "error": error,
+            "timestamp": time.time(),
+            "error": None,
         }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except OSError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
@@ -523,12 +563,13 @@ async def status(
     ip: Optional[str] = Query(default=None),
     port: Optional[int] = Query(default=None),
 ):
+    ctl = _controller(ip, port, module)
     try:
-        if ip is not None and port is not None:
-            _validate_ip_port(ip, port)
-            _init_cache_if_needed(module)
-            _refresh_module_cache(module, ip, port)
-        voltage, current, error, ts = _get_cached_channel(module, ch)
+        voltage = ctl.read_voltage(ch)
+        current = ctl.read_current(ch)
+        set_voltage = ctl.read_set_voltage(ch)
+        current_limit = ctl.read_current_limit(ch)
+        ramp = ctl.read_ramp(ch)
         return {
             "module": module,
             "server_id": _module_server_id(module),
@@ -536,8 +577,37 @@ async def status(
             "ch": ch,
             "voltage": voltage,
             "current": current,
-            "timestamp": ts,
-            "error": error,
+            "set_voltage": set_voltage,
+            "current_limit": current_limit,
+            "ramp": ramp,
+            "timestamp": time.time(),
+            "error": None,
         }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.get("/{module}/setting/{ch}")
+async def setting(
+    module: str,
+    ch: int,
+    ip: Optional[str] = Query(default=None),
+    port: Optional[int] = Query(default=None),
+):
+    ctl = _controller(ip, port, module)
+    try:
+        return {
+            "module": module,
+            "server_id": _module_server_id(module),
+            "api_base_uri": _module_api_base_uri(module),
+            "ch": ch,
+            "set_voltage": ctl.read_set_voltage(ch),
+            "current_limit": ctl.read_current_limit(ch),
+            "ramp": ctl.read_ramp(ch),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except OSError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
