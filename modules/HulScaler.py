@@ -22,26 +22,21 @@ class HulScaler(BaseScaler):
             "0xc480": [
                 [
                     "read_mzn_scr {1} up {0} 0",
-                    "od -An -j72 -v -t u4 -w4 {0}",
-                    "od -An -j12 -N4 -v -t u4 -w4 {0}",
-                ],
-                [
-                    "read_mzn_scr {1} low {0} 0",
-                    "od -An -j72 -v -t u4 -w4 {0}",
+                    "od -An -j80 -v -t u4 -w4 {0}",
                     "od -An -j12 -N4 -v -t u4 -w4 {0}",
                 ],
             ],
             "0x60c4": [
                 [
                     "read_scr {1} {0} 0",
-                    "od -An -j72 -v -t u4 -w4 {0}",
+                    "od -An -j80 -v -t u4 -w4 {0}",
                     "od -An -j12 -N4 -v -t u4 -w4 {0}",
                 ],
             ],
             "0xf000": [
                 [
                     "read_scr {1} {0} 0",
-                    "od -An -j72 -v -t u4 -w4 {0}",
+                    "od -An -j80 -v -t u4 -w4 {0}",
                     "od -An -j12 -N4 -v -t u4 -w4 {0}",
                 ]
             ],
