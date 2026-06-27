@@ -200,6 +200,7 @@ cover/
 
 # Django stuff:
 local_settings.py
+!modules/local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
