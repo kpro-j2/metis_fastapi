@@ -230,6 +230,40 @@ async def root():
     return {"message": "RPH032 control API"}
 
 
+def export_cached_all() -> Dict[str, object]:
+    with _cache_lock:
+        cache_copy = {
+            str(module): {
+                "timestamp": data.get("timestamp"),
+                "error": data.get("error"),
+                "voltage": dict(data.get("voltage", {})),
+                "current": dict(data.get("current", {})),
+            }
+            for module, data in _module_cache.items()
+        }
+    with _target_lock:
+        target_copy = {
+            str(module): {
+                "server_id": cfg.get("server_id", "default"),
+                "ip": cfg.get("ip"),
+                "port": cfg.get("port"),
+            }
+            for module, cfg in _target_config.items()
+        }
+    return {
+        "modules": cache_copy,
+        "targets": target_copy,
+    }
+
+
+@router.get("/read/cache/all")
+async def read_cache_all():
+    return {
+        "message": "ok",
+        "items": export_cached_all(),
+    }
+
+
 @router.get("/config/get")
 async def config_get():
     # Legacy endpoint returns default module config.

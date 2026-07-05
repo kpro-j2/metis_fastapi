@@ -58,7 +58,11 @@ class RunRecord(Base):
    end_state: Mapped[str] = mapped_column(String(64), nullable=True)
    status: Mapped[str] = mapped_column(String(32), nullable=False)
    start_detail_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+   start_scaler_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+   start_hv_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
    end_detail_json: Mapped[str] = mapped_column(Text, nullable=True)
+   end_scaler_json: Mapped[str] = mapped_column(Text, nullable=True)
+   end_hv_json: Mapped[str] = mapped_column(Text, nullable=True)
    updated_ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
    __table_args__ = (

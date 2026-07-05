@@ -11,12 +11,14 @@ from routers import RouterSystemCommand
 from routers import RouterScaler
 from routers import ControlNestDAQ
 from routers import RouterRph032
+from routers import RouterTelemetry
 # logging.basicConfig(level=logging.WARNING)
 app = FastAPI()
 app.include_router(ControlNestDAQ.router)
 app.include_router(RouterSystemCommand.router)
 app.include_router(RouterScaler.router)
 app.include_router(RouterRph032.router)
+app.include_router(RouterTelemetry.router)
 # app.include_router(ControlBabirl.router)
 
 cors_origins_raw = os.getenv("CORS_ALLOW_ORIGINS", "*")

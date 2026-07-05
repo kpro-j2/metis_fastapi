@@ -48,12 +48,32 @@ async def scaler_read_info_id(id: str):
 
 @router.get("/read/data/all")
 async def scaler_read_data_all():
-    return factory.get_data()
+    return factory.get_data_cached()
 
 
 @router.get("/read/data/{id}/")
 async def scaler_read_data_id(id: str):
+    return factory.get_data_cached(id)
+
+
+@router.get("/read/data_live/all")
+async def scaler_read_data_live_all():
+    return factory.get_data()
+
+
+@router.get("/read/data_live/{id}/")
+async def scaler_read_data_live_id(id: str):
     return factory.get_data(id)
+
+
+@router.get("/read/data_cached/all")
+async def scaler_read_data_cached_all():
+    return factory.get_data_cached()
+
+
+@router.get("/read/data_cached/{id}/")
+async def scaler_read_data_cached_id(id: str):
+    return factory.get_data_cached(id)
 
 
 @router.get("/read/{ip}/")

@@ -343,6 +343,24 @@ def _arm_transition_watch_from_command(rcli, command: str):
 
 def _record_transition_watch_result(mode: str, run_number: Optional[int], final_state: str, timed_out: bool, detail: Dict[str, Any]):
    now_ts = _now_ts()
+   def _collect_transition_telemetry_snapshot() -> Dict[str, Any]:
+      snapshot: Dict[str, Any] = {
+         "captured_ts_ms": _now_ts(),
+         "scaler": {},
+         "hv": {},
+      }
+      try:
+         from routers import RouterScaler
+         snapshot["scaler"] = RouterScaler.factory.get_data_cached()
+      except Exception as ex:
+         snapshot["scaler"] = {"error": str(ex)}
+      try:
+         from routers import RouterRph032
+         snapshot["hv"] = RouterRph032.export_cached_all()
+      except Exception as ex:
+         snapshot["hv"] = {"error": str(ex)}
+      return snapshot
+
    if mode == "start":
       if timed_out:
          _record_anomaly(
@@ -355,6 +373,8 @@ def _record_transition_watch_result(mode: str, run_number: Optional[int], final_
             detail=detail,
          )
       else:
+         transition_detail = dict(detail)
+         transition_detail["telemetry_snapshot"] = _collect_transition_telemetry_snapshot()
          _record_state_transition(
             event_ts_ms=now_ts,
             transition_type="run_start",
@@ -362,7 +382,7 @@ def _record_transition_watch_result(mode: str, run_number: Optional[int], final_
             to_state="RUNNING",
             run_number=run_number,
             message="Detected IDLE => RUNNING transition sequence",
-            detail=detail,
+            detail=transition_detail,
          )
       return
 
@@ -378,6 +398,8 @@ def _record_transition_watch_result(mode: str, run_number: Optional[int], final_
             detail=detail,
          )
       else:
+         transition_detail = dict(detail)
+         transition_detail["telemetry_snapshot"] = _collect_transition_telemetry_snapshot()
          _record_state_transition(
             event_ts_ms=now_ts,
             transition_type="run_end",
@@ -385,7 +407,7 @@ def _record_transition_watch_result(mode: str, run_number: Optional[int], final_
             to_state="IDLE",
             run_number=run_number,
             message="Detected RUNNING => IDLE transition sequence",
-            detail=detail,
+            detail=transition_detail,
          )
 
 

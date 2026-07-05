@@ -78,7 +78,24 @@ class SQLAlchemyStateLogRepository:
       finally:
          session.close()
 
+   @staticmethod
+   def _extract_telemetry_json(detail: Dict[str, Any]) -> tuple:
+      telemetry = detail.get("telemetry_snapshot", {}) if isinstance(detail, dict) else {}
+      if not isinstance(telemetry, dict):
+         telemetry = {}
+      scaler = telemetry.get("scaler", {})
+      hv = telemetry.get("hv", {})
+      if not isinstance(scaler, dict):
+         scaler = {"value": scaler}
+      if not isinstance(hv, dict):
+         hv = {"value": hv}
+      return (
+         json.dumps(scaler, ensure_ascii=False),
+         json.dumps(hv, ensure_ascii=False),
+      )
+
    def record_transition(self, payload: TransitionPayload) -> None:
+      start_scaler_json, start_hv_json = self._extract_telemetry_json(payload.detail)
       transition = StateTransition(
          event_ts_ms=int(payload.event_ts_ms),
          recorded_ts_ms=int(payload.event_ts_ms),
@@ -112,6 +129,8 @@ class SQLAlchemyStateLogRepository:
                   },
                   ensure_ascii=False,
                )
+               row.end_scaler_json = start_scaler_json
+               row.end_hv_json = start_hv_json
                row.updated_ts_ms = int(payload.event_ts_ms)
 
             new_run_status = RUN_STATUS_ABNORMAL_RUNNING if len(open_rows) > 0 else RUN_STATUS_RUNNING
@@ -124,7 +143,11 @@ class SQLAlchemyStateLogRepository:
                   end_state=None,
                   status=new_run_status,
                   start_detail_json=json.dumps(payload.detail, ensure_ascii=False),
+                  start_scaler_json=start_scaler_json,
+                  start_hv_json=start_hv_json,
                   end_detail_json=None,
+                  end_scaler_json=None,
+                  end_hv_json=None,
                   updated_ts_ms=int(payload.event_ts_ms),
                )
             )
@@ -159,6 +182,8 @@ class SQLAlchemyStateLogRepository:
                         },
                         ensure_ascii=False,
                      ),
+                     start_scaler_json=start_scaler_json,
+                     start_hv_json=start_hv_json,
                      end_detail_json=json.dumps(
                         {
                            **payload.detail,
@@ -166,6 +191,8 @@ class SQLAlchemyStateLogRepository:
                         },
                         ensure_ascii=False,
                      ),
+                     end_scaler_json=start_scaler_json,
+                     end_hv_json=start_hv_json,
                      updated_ts_ms=int(payload.event_ts_ms),
                   )
                )
@@ -178,6 +205,8 @@ class SQLAlchemyStateLogRepository:
                   else RUN_STATUS_ENDED
                )
                row.end_detail_json = json.dumps(payload.detail, ensure_ascii=False)
+               row.end_scaler_json = start_scaler_json
+               row.end_hv_json = start_hv_json
                row.updated_ts_ms = int(payload.event_ts_ms)
 
    def record_anomaly(self, payload: AnomalyPayload) -> None:
