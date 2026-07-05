@@ -13,17 +13,32 @@ async def root() :
 @router.get('/exec/{cmd:path}')
 async def exec(cmd: str):
    try:
-#      ret = subprocess.Popen(cmd, shell=True, text=True)
-#      p.wait()
-      p = subprocess.Popen(cmd, shell=True, text=True, stdout=subprocess.PIPE)
-      ret = p.stdout
-#      p.wait()
-#      ret = subprocess.Popen(cmd, shell=True, capture_output=True, text=True).stdout
-#      ret = subprocess.check_output(cmd, shell=True, text=True)
-#      ret = subprocess.run(cmd, shell=True, text=True)
+      completed = subprocess.run(
+         cmd,
+         shell=True,
+         text=True,
+         stdout=subprocess.PIPE,
+         stderr=subprocess.PIPE,
+      )
+      ret_out = (completed.stdout or "").strip()
+      ret_err = (completed.stderr or "").strip()
+      message = ret_out if ret_out else ret_err
+      return {
+         "message": message,
+         "stdout": ret_out,
+         "stderr": ret_err,
+         "returncode": int(completed.returncode),
+         "success": completed.returncode == 0,
+      }
    except Exception as e:
-      ret = "Error in subprocess.Popen(" + cmd + ") : " + str(e)
-   return {"message": ret}
+      ret = "Error in subprocess.run(" + cmd + ") : " + str(e)
+      return {
+         "message": ret,
+         "stdout": "",
+         "stderr": ret,
+         "returncode": -1,
+         "success": False,
+      }
 
 @router.get('/exec/')
 async def exec():
