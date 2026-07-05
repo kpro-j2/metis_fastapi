@@ -45,6 +45,40 @@ _last_summary = {
    "auto_recovery_enabled": _auto_recovery_enabled,
 }
 _last_recovery_ts = 0.0
+_auto_run_change_lock = threading.Lock()
+_auto_run_change_thread: Optional[threading.Thread] = None
+_state_change_timeout_sec = int(os.getenv("NESTDAQ_STATE_CHANGE_TIMEOUT_SEC", "20"))
+_state_change_wait_interval_sec = float(os.getenv("NESTDAQ_STATE_CHANGE_WAIT_INTERVAL_SEC", "1.0"))
+
+_daq_state_destination = {
+   "CONNECT": "DEVICE READY",
+   "INIT TASK": "READY",
+   "RUN": "RUNNING",
+   "STOP": "READY",
+   "RESET TASK": "DEVICE READY",
+   "RESET DEVICE": "IDLE",
+   "END": "NO PROCESS",
+}
+
+_hook_cmd_key = {
+   "PRE START": "run_info:pre_start_script",
+   "POST START": "run_info:post_start_script",
+   "PRE STOP": "run_info:pre_stop_script",
+   "POST STOP": "run_info:post_stop_script",
+}
+
+_auto_run_change_sequence = [
+   "PRE STOP",
+   "STOP",
+   "RESET TASK",
+   "RESET DEVICE",
+   "POST STOP",
+   "PRE START",
+   "CONNECT",
+   "INIT TASK",
+   "RUN",
+   "POST START",
+]
 
 
 def _rcli():
@@ -194,6 +228,204 @@ def _run_recovery_action(action: str) -> Dict:
    }
 
 
+def _read_text_key(rcli, key: str, default: str = "") -> str:
+   try:
+      raw = rcli.get(key)
+   except Exception:
+      return default
+   text = _to_text(raw)
+   if text is None:
+      return default
+   return str(text)
+
+
+def _read_int_key(rcli, key: str, default: int = 0) -> int:
+   text = _read_text_key(rcli, key, "").strip()
+   if text == "":
+      return default
+   try:
+      return int(float(text))
+   except Exception:
+      return default
+
+
+def _merged_daq_state(rcli) -> str:
+   status = _collect_status(rcli)
+   states = status.get("states", {})
+   if len(states) == 0:
+      return "NO PROCESS"
+   unique_states = sorted({str(v) for v in states.values() if str(v) != ""})
+   if len(unique_states) == 1:
+      return unique_states[0]
+   return "MISMATCH"
+
+
+def _publish_change_state(rcli, command: str):
+   payload = json.dumps(
+      {
+         "command": "change_state",
+         "value": command,
+         "services": ["all"],
+         "instances": ["all"],
+      },
+      separators=(",", ":"),
+      ensure_ascii=True,
+   )
+   rcli.publish("daqctl", payload)
+
+
+def _wait_for_state_change(rcli, destination: str, timeout_sec: int) -> bool:
+   start = time.time()
+   while time.time() - start < timeout_sec:
+      if _merged_daq_state(rcli) == destination:
+         return True
+      wait_sec = _state_change_wait_interval_sec if _state_change_wait_interval_sec > 0 else 1.0
+      time.sleep(wait_sec)
+   return False
+
+
+def _run_hook_script(rcli, stage: str, hook_key: str):
+   cmd = _read_text_key(rcli, hook_key, "").strip()
+   if cmd == "":
+      return
+
+   try:
+      completed = subprocess.run(
+         cmd,
+         shell=True,
+         capture_output=True,
+         text=True,
+         timeout=_recovery_timeout_sec,
+         check=False,
+      )
+      if completed.returncode != 0:
+         rcli.set("run_info:daq_error_status", "script_error:" + hook_key)
+         _emit_event(
+            event_type="hook_script_failed",
+            severity="warning",
+            source="auto-run-change",
+            state_before=stage,
+            state_after=stage,
+            action=cmd,
+            result="failed",
+         )
+   except Exception:
+      rcli.set("run_info:daq_error_status", "script_error:" + hook_key)
+      _emit_event(
+         event_type="hook_script_failed",
+         severity="warning",
+         source="auto-run-change",
+         state_before=stage,
+         state_after=stage,
+         action=cmd,
+         result="failed",
+      )
+
+
+def _run_auto_run_change_sequence_worker():
+   rcli = aProxy.instance()
+   if rcli is None:
+      return
+
+   rcli.set("run_info:daq_error_status", "")
+   _emit_event(
+      event_type="auto_run_change_started",
+      severity="info",
+      source="auto-run-change",
+      state_before="RUNNING",
+      state_after="RUNNING",
+      action="rotate_run",
+      result="running",
+   )
+
+   for cmd in _auto_run_change_sequence:
+      if cmd in _hook_cmd_key:
+         _run_hook_script(rcli, cmd, _hook_cmd_key[cmd])
+         continue
+
+      if cmd == "STOP":
+         rcli.incr("run_info:run_number")
+
+      if cmd == "RUN":
+         run_ts = int(time.time())
+         rcli.set("run_info:run_start_unix_time", str(run_ts))
+         run_number = _read_text_key(rcli, "run_info:run_number", "")
+         rcli.set("run_info:latest_run_number", run_number)
+
+      try:
+         _publish_change_state(rcli, cmd)
+      except Exception:
+         rcli.set("run_info:daq_error_status", "publish_error")
+         _emit_event(
+            event_type="auto_run_change_failed",
+            severity="critical",
+            source="auto-run-change",
+            state_before=cmd,
+            state_after=cmd,
+            action="publish",
+            result="failed",
+         )
+         return
+
+      destination = _daq_state_destination.get(cmd)
+      if destination and (not _wait_for_state_change(rcli, destination, _state_change_timeout_sec)):
+         rcli.set("run_info:daq_error_status", "wait_for_state_change")
+         _emit_event(
+            event_type="auto_run_change_failed",
+            severity="critical",
+            source="auto-run-change",
+            state_before=cmd,
+            state_after=destination,
+            action="wait_state",
+            result="timeout",
+         )
+         return
+
+   _emit_event(
+      event_type="auto_run_change_finished",
+      severity="info",
+      source="auto-run-change",
+      state_before="RUNNING",
+      state_after="RUNNING",
+      action="rotate_run",
+      result="success",
+   )
+
+
+def _start_auto_run_change_if_needed(summary: Dict, rcli):
+   global _auto_run_change_thread
+
+   if summary.get("state") != "RUNNING":
+      return
+
+   mode = _read_text_key(rcli, "run_info:auto_run_change_mode", "")
+   if mode != "enabled":
+      return
+
+   duration_sec = _read_int_key(rcli, "run_info:auto_run_change_dur", 0)
+   if duration_sec <= 0:
+      return
+
+   start_unix_time = _read_int_key(rcli, "run_info:run_start_unix_time", 0)
+   if start_unix_time <= 0:
+      return
+
+   elapsed_sec = int(time.time()) - start_unix_time
+   if elapsed_sec < duration_sec:
+      return
+
+   with _auto_run_change_lock:
+      if _auto_run_change_thread is not None and _auto_run_change_thread.is_alive():
+         return
+      # Set to 0 before starting so another worker does not retrigger immediately.
+      rcli.set("run_info:run_start_unix_time", "0")
+      _auto_run_change_thread = threading.Thread(
+         target=_run_auto_run_change_sequence_worker,
+         daemon=True,
+      )
+      _auto_run_change_thread.start()
+
+
 def _monitor_once():
    global _last_summary
    global _last_recovery_ts
@@ -214,6 +446,9 @@ def _monitor_once():
       }
    else:
       summary = _evaluate_summary(_collect_status(rcli))
+
+   if rcli is not None:
+      _start_auto_run_change_if_needed(summary, rcli)
 
    with _health_lock:
       _last_summary = summary
