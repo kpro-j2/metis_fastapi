@@ -4,12 +4,13 @@ import subprocess
 import threading
 import time
 from collections import deque
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from metis_fastapi.dependencies import get_redis_proxy
+from modules.local_settings import get_setting, set_setting, get_settings_file_path
 router = APIRouter(
    prefix="/nestdaq",
    tags=["nestdaq"]
@@ -20,6 +21,7 @@ aProxy = get_redis_proxy(0)
 
 _health_lock = threading.Lock()
 _event_cv = threading.Condition()
+_config_lock = threading.Lock()
 _monitor_thread: Optional[threading.Thread] = None
 _monitor_interval_sec = float(os.getenv("NESTDAQ_MONITOR_INTERVAL_SEC", "1.0"))
 _stale_threshold_sec = float(os.getenv("NESTDAQ_STALE_THRESHOLD_SEC", "5.0"))
@@ -27,15 +29,46 @@ _event_buffer_max = int(os.getenv("NESTDAQ_EVENT_BUFFER_MAX", "500"))
 _recovery_cooldown_sec = float(os.getenv("NESTDAQ_RECOVERY_COOLDOWN_SEC", "60.0"))
 _recovery_timeout_sec = int(os.getenv("NESTDAQ_RECOVERY_TIMEOUT_SEC", "120"))
 _auto_recovery_enabled = os.getenv("NESTDAQ_AUTO_RECOVERY", "0") == "1"
+_auto_resume_after_recovery_enabled = os.getenv("NESTDAQ_AUTO_RESUME_AFTER_RECOVERY", "1") == "1"
+_resume_prepare_timeout_sec = int(os.getenv("NESTDAQ_RESUME_PREPARE_TIMEOUT_SEC", "90"))
 _recovery_script = os.getenv(
    "NESTDAQ_RECOVERY_SCRIPT",
    "/home/akeno/repos/workdir-akeno-spadi/scripts/run-nestdaq-akeno.sh",
 )
+_expected_services = [
+   s.strip()
+   for s in os.getenv(
+      "NESTDAQ_EXPECTED_SERVICES",
+      "",
+   ).split(",")
+   if s.strip() != ""
+]
+_observed_services: Set[str] = set()
+_monitor_config_defaults = {
+   "monitor_interval_sec": float(os.getenv("NESTDAQ_MONITOR_INTERVAL_SEC", "1.0")),
+   "stale_threshold_sec": float(os.getenv("NESTDAQ_STALE_THRESHOLD_SEC", "5.0")),
+   "recovery_cooldown_sec": float(os.getenv("NESTDAQ_RECOVERY_COOLDOWN_SEC", "60.0")),
+   "recovery_timeout_sec": int(os.getenv("NESTDAQ_RECOVERY_TIMEOUT_SEC", "120")),
+   "auto_recovery_enabled": os.getenv("NESTDAQ_AUTO_RECOVERY", "0") == "1",
+   "auto_resume_after_recovery_enabled": os.getenv("NESTDAQ_AUTO_RESUME_AFTER_RECOVERY", "1") == "1",
+   "resume_prepare_timeout_sec": int(os.getenv("NESTDAQ_RESUME_PREPARE_TIMEOUT_SEC", "90")),
+   "recovery_script": os.getenv(
+      "NESTDAQ_RECOVERY_SCRIPT",
+      "/home/akeno/repos/workdir-akeno-spadi/scripts/run-nestdaq-akeno.sh",
+   ),
+   "expected_services": [
+      s.strip()
+      for s in os.getenv("NESTDAQ_EXPECTED_SERVICES", "").split(",")
+      if s.strip() != ""
+   ],
+}
 
 _events = deque(maxlen=_event_buffer_max)
 _last_summary = {
    "overall": "unknown",
    "service_count": 0,
+   "missing_expected_services": [],
+   "process_health": "unknown",
    "mismatch": False,
    "stale_services": [],
    "state": "",
@@ -43,8 +76,10 @@ _last_summary = {
    "updated": {},
    "last_checked_ts": 0,
    "auto_recovery_enabled": _auto_recovery_enabled,
+   "auto_resume_after_recovery_enabled": _auto_resume_after_recovery_enabled,
 }
 _last_recovery_ts = 0.0
+_run_was_active_since_idle = False
 _auto_run_change_lock = threading.Lock()
 _auto_run_change_thread: Optional[threading.Thread] = None
 _state_change_timeout_sec = int(os.getenv("NESTDAQ_STATE_CHANGE_TIMEOUT_SEC", "20"))
@@ -79,6 +114,72 @@ _auto_run_change_sequence = [
    "RUN",
    "POST START",
 ]
+
+
+def _normalize_expected_services(value) -> List[str]:
+   if isinstance(value, str):
+      seq = value.split(",")
+   elif isinstance(value, list):
+      seq = value
+   else:
+      seq = []
+   return sorted({str(v).strip() for v in seq if str(v).strip() != ""})
+
+
+def _monitor_config_dict() -> Dict:
+   return {
+      "monitor_interval_sec": _monitor_interval_sec,
+      "stale_threshold_sec": _stale_threshold_sec,
+      "recovery_cooldown_sec": _recovery_cooldown_sec,
+      "recovery_timeout_sec": _recovery_timeout_sec,
+      "auto_recovery_enabled": _auto_recovery_enabled,
+      "auto_resume_after_recovery_enabled": _auto_resume_after_recovery_enabled,
+      "resume_prepare_timeout_sec": _resume_prepare_timeout_sec,
+      "recovery_script": _recovery_script,
+      "expected_services": list(_expected_services),
+   }
+
+
+def _apply_monitor_config(config: Dict):
+   global _monitor_interval_sec
+   global _stale_threshold_sec
+   global _recovery_cooldown_sec
+   global _recovery_timeout_sec
+   global _auto_recovery_enabled
+   global _auto_resume_after_recovery_enabled
+   global _resume_prepare_timeout_sec
+   global _recovery_script
+   global _expected_services
+
+   _monitor_interval_sec = max(0.2, float(config.get("monitor_interval_sec", _monitor_config_defaults["monitor_interval_sec"])))
+   _stale_threshold_sec = max(0.5, float(config.get("stale_threshold_sec", _monitor_config_defaults["stale_threshold_sec"])))
+   _recovery_cooldown_sec = max(1.0, float(config.get("recovery_cooldown_sec", _monitor_config_defaults["recovery_cooldown_sec"])))
+   _recovery_timeout_sec = max(10, int(config.get("recovery_timeout_sec", _monitor_config_defaults["recovery_timeout_sec"])))
+   _auto_recovery_enabled = bool(config.get("auto_recovery_enabled", _monitor_config_defaults["auto_recovery_enabled"]))
+   _auto_resume_after_recovery_enabled = bool(
+      config.get("auto_resume_after_recovery_enabled", _monitor_config_defaults["auto_resume_after_recovery_enabled"])
+   )
+   _resume_prepare_timeout_sec = max(
+      10,
+      int(config.get("resume_prepare_timeout_sec", _monitor_config_defaults["resume_prepare_timeout_sec"])),
+   )
+   _recovery_script = str(config.get("recovery_script", _monitor_config_defaults["recovery_script"]))
+   _expected_services = _normalize_expected_services(
+      config.get("expected_services", _monitor_config_defaults["expected_services"])
+   )
+
+
+def _load_monitor_config_from_settings():
+   stored = get_setting("nestdaq_monitor_config", {})
+   if not isinstance(stored, dict):
+      stored = {}
+   merged = dict(_monitor_config_defaults)
+   merged.update(stored)
+   _apply_monitor_config(merged)
+
+
+def _save_monitor_config_to_settings(config: Dict):
+   set_setting("nestdaq_monitor_config", config)
 
 
 def _rcli():
@@ -168,6 +269,8 @@ def _collect_status(rcli) -> Dict:
 
 
 def _evaluate_summary(status: Dict) -> Dict:
+   global _observed_services
+
    states = status.get("states", {})
    updated = status.get("updated", {})
    now = time.time()
@@ -193,9 +296,25 @@ def _evaluate_summary(status: Dict) -> Dict:
    if stale_services:
       overall = "critical" if len(states) > 0 else overall
 
+   live_services = {str(name) for name in states.keys() if str(name) != ""}
+   if len(live_services) > 0:
+      _observed_services = _observed_services.union(live_services)
+   if len(_expected_services) > 0:
+      expected_services = set(_expected_services)
+   elif len(_observed_services) > 0:
+      expected_services = set(_observed_services)
+   else:
+      expected_services = set(live_services)
+   missing_expected_services = sorted([s for s in expected_services if s not in live_services])
+   process_health = "ok" if len(missing_expected_services) == 0 else "critical"
+   if len(missing_expected_services) > 0:
+      overall = "critical"
+
    return {
       "overall": overall,
       "service_count": len(states),
+      "missing_expected_services": missing_expected_services,
+      "process_health": process_health,
       "mismatch": mismatch,
       "stale_services": sorted(stale_services),
       "state": merged_state,
@@ -203,6 +322,7 @@ def _evaluate_summary(status: Dict) -> Dict:
       "updated": updated,
       "last_checked_ts": _now_ts(),
       "auto_recovery_enabled": _auto_recovery_enabled,
+      "auto_resume_after_recovery_enabled": _auto_resume_after_recovery_enabled,
    }
 
 
@@ -426,9 +546,96 @@ def _start_auto_run_change_if_needed(summary: Dict, rcli):
       _auto_run_change_thread.start()
 
 
+def _run_data_collection_resume_sequence(rcli, sequence: List[str]) -> bool:
+   for cmd in sequence:
+      if cmd in _hook_cmd_key:
+         _run_hook_script(rcli, cmd, _hook_cmd_key[cmd])
+         continue
+
+      if cmd == "RUN":
+         run_ts = int(time.time())
+         rcli.set("run_info:run_start_unix_time", str(run_ts))
+         run_number = _read_text_key(rcli, "run_info:run_number", "")
+         rcli.set("run_info:latest_run_number", run_number)
+
+      try:
+         _publish_change_state(rcli, cmd)
+      except Exception:
+         rcli.set("run_info:daq_error_status", "publish_error")
+         return False
+
+      destination = _daq_state_destination.get(cmd)
+      if destination and (not _wait_for_state_change(rcli, destination, _state_change_timeout_sec)):
+         rcli.set("run_info:daq_error_status", "wait_for_state_change")
+         return False
+   return True
+
+
+def _resume_data_collection_after_recovery(rcli, before_state: str):
+   if (not _auto_resume_after_recovery_enabled) or before_state != "RUNNING":
+      return
+
+   start = time.time()
+   current_state = _merged_daq_state(rcli)
+   while current_state not in {"IDLE", "DEVICE READY", "READY", "RUNNING"}:
+      if time.time() - start >= _resume_prepare_timeout_sec:
+         _emit_event(
+            event_type="resume_after_recovery_failed",
+            severity="critical",
+            source="nestdaq-monitor",
+            state_before=before_state,
+            state_after=current_state,
+            action="wait_ready_state",
+            result="timeout",
+         )
+         return
+      time.sleep(1.0)
+      current_state = _merged_daq_state(rcli)
+
+   if current_state == "RUNNING":
+      _emit_event(
+         event_type="resume_after_recovery_finished",
+         severity="info",
+         source="nestdaq-monitor",
+         state_before=before_state,
+         state_after=current_state,
+         action="resume_run",
+         result="success",
+      )
+      return
+
+   if current_state == "IDLE":
+      sequence = ["PRE START", "CONNECT", "INIT TASK", "RUN", "POST START"]
+   elif current_state == "DEVICE READY":
+      sequence = ["INIT TASK", "RUN", "POST START"]
+   else:
+      sequence = ["RUN", "POST START"]
+
+   ok = _run_data_collection_resume_sequence(rcli, sequence)
+   _emit_event(
+      event_type="resume_after_recovery_finished" if ok else "resume_after_recovery_failed",
+      severity="info" if ok else "critical",
+      source="nestdaq-monitor",
+      state_before=before_state,
+      state_after=_merged_daq_state(rcli),
+      action="resume_run",
+      result="success" if ok else "failed",
+   )
+
+
+def _should_increment_run_number_on_recovery(before_state: str, run_was_active_since_idle: bool) -> bool:
+   b = str(before_state or "")
+   if b == "RUNNING":
+      return True
+   if run_was_active_since_idle and b in {"READY", "DEVICE READY"}:
+      return True
+   return False
+
+
 def _monitor_once():
    global _last_summary
    global _last_recovery_ts
+   global _run_was_active_since_idle
 
    before = _last_summary
    rcli = aProxy.instance()
@@ -436,6 +643,8 @@ def _monitor_once():
       summary = {
          "overall": "critical",
          "service_count": 0,
+         "missing_expected_services": [],
+         "process_health": "critical",
          "mismatch": False,
          "stale_services": [],
          "state": "NO REDIS",
@@ -443,9 +652,16 @@ def _monitor_once():
          "updated": {},
          "last_checked_ts": _now_ts(),
          "auto_recovery_enabled": _auto_recovery_enabled,
+         "auto_resume_after_recovery_enabled": _auto_resume_after_recovery_enabled,
       }
    else:
       summary = _evaluate_summary(_collect_status(rcli))
+
+   current_state = str(summary.get("state", ""))
+   if current_state == "RUNNING":
+      _run_was_active_since_idle = True
+   elif current_state == "IDLE":
+      _run_was_active_since_idle = False
 
    if rcli is not None:
       _start_auto_run_change_if_needed(summary, rcli)
@@ -491,10 +707,24 @@ def _monitor_once():
          result="success",
       )
 
+   # Expected services missing from redis status indicates process-level anomaly.
+   if len(summary.get("missing_expected_services", [])) > 0 and len(before.get("missing_expected_services", [])) == 0:
+      _emit_event(
+         event_type="process_missing_detected",
+         severity="critical",
+         source="nestdaq-monitor",
+         state_before=str(before.get("state", "")),
+         state_after=str(summary.get("state", "")),
+         action="none",
+         result=",".join(summary.get("missing_expected_services", [])),
+      )
+
    if _auto_recovery_enabled and summary.get("overall") == "critical":
       now = time.time()
       if now - _last_recovery_ts >= _recovery_cooldown_sec:
          _last_recovery_ts = now
+         before_state = str(before.get("state", ""))
+         increment_run_number = _should_increment_run_number_on_recovery(before_state, _run_was_active_since_idle)
          _emit_event(
             event_type="recovery_started",
             severity="warning",
@@ -507,6 +737,19 @@ def _monitor_once():
          try:
             rec = _run_recovery_action("restart_all")
             ok = rec.get("returncode", 1) == 0
+            if ok and rcli is not None and increment_run_number:
+               new_run_number = rcli.incr("run_info:run_number")
+               _emit_event(
+                  event_type="run_number_incremented_on_recovery",
+                  severity="info",
+                  source="nestdaq-monitor",
+                  state_before=before_state,
+                  state_after=str(summary.get("state", "")),
+                  action="increment_run_number",
+                  result=str(new_run_number),
+               )
+            if ok and rcli is not None:
+               _resume_data_collection_after_recovery(rcli, before_state)
             _emit_event(
                event_type="recovery_finished",
                severity="info" if ok else "critical",
@@ -559,11 +802,53 @@ def _sse_data(event: Dict) -> str:
    return f"event: nestdaq\ndata: {payload}\n\n"
 
 
+_load_monitor_config_from_settings()
 _start_monitor_if_needed()
 
 @router.get('/')
 async def root() : 
    return {"message": "nestdaq api"}
+
+
+@router.get('/monitor/config/get')
+async def monitor_config_get():
+   with _config_lock:
+      current = _monitor_config_dict()
+   return {
+      "message": "ok",
+      "current": current,
+      "defaults": dict(_monitor_config_defaults),
+      "settings_file": get_settings_file_path(),
+   }
+
+
+@router.post('/monitor/config/set')
+async def monitor_config_set(payload: Dict):
+   if not isinstance(payload, dict):
+      raise HTTPException(status_code=400, detail="payload must be an object")
+
+   with _config_lock:
+      base = dict(_monitor_config_defaults)
+      base.update(_monitor_config_dict())
+      base.update(payload)
+      _apply_monitor_config(base)
+      current = _monitor_config_dict()
+      _save_monitor_config_to_settings(current)
+
+   _emit_event(
+      event_type="monitor_config_updated",
+      severity="info",
+      source="api-request",
+      state_before="",
+      state_after="",
+      action="update_monitor_config",
+      result="success",
+   )
+   return {
+      "message": "ok",
+      "current": current,
+      "settings_file": get_settings_file_path(),
+   }
 
 @router.get('/status/')
 async def read_status():
