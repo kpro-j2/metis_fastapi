@@ -4,13 +4,29 @@ import subprocess
 import threading
 import time
 from collections import deque
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from sqlalchemy import text
 
 from metis_fastapi.dependencies import get_redis_proxy
 from modules.local_settings import get_setting, set_setting, get_settings_file_path
+from modules.state_log_db import (
+   get_state_log_engine,
+   set_state_log_runtime_config,
+   state_log_backend,
+   state_log_database_url,
+   state_log_default_config,
+   state_log_runtime_config,
+   state_log_schema_ready,
+)
+from modules.state_log_repository import (
+   AnomalyPayload,
+   SQLAlchemyStateLogRepository,
+   StateLogRepositoryError,
+   TransitionPayload,
+)
 router = APIRouter(
    prefix="/nestdaq",
    tags=["nestdaq"]
@@ -64,6 +80,27 @@ _monitor_config_defaults = {
 }
 
 _events = deque(maxlen=_event_buffer_max)
+_state_log_target = state_log_database_url()
+_state_log_queue_max = int(os.getenv("NESTDAQ_STATE_LOG_QUEUE_MAX", "20000"))
+_state_log_retry_sec = float(os.getenv("NESTDAQ_STATE_LOG_RETRY_SEC", "2.0"))
+_state_log_lock = threading.Lock()
+_state_log_cv = threading.Condition(_state_log_lock)
+_state_log_queue = deque(maxlen=_state_log_queue_max)
+_state_log_writer_thread: Optional[threading.Thread] = None
+_state_log_repository = SQLAlchemyStateLogRepository()
+_state_log_status = {
+   "enabled": True,
+   "backend": state_log_backend(),
+   "db_target": _state_log_target,
+   "db_available": False,
+   "pending_records": 0,
+   "total_written": 0,
+   "total_dropped": 0,
+   "last_write_ts": 0,
+   "last_error": "",
+   "last_error_ts": 0,
+}
+_state_log_db_notified_unavailable = False
 _last_summary = {
    "overall": "unknown",
    "service_count": 0,
@@ -80,6 +117,7 @@ _last_summary = {
 }
 _last_recovery_ts = 0.0
 _run_was_active_since_idle = False
+_transition_watch: Optional[Dict[str, Any]] = None
 _auto_run_change_lock = threading.Lock()
 _auto_run_change_thread: Optional[threading.Thread] = None
 _state_change_timeout_sec = int(os.getenv("NESTDAQ_STATE_CHANGE_TIMEOUT_SEC", "20"))
@@ -222,6 +260,381 @@ def _emit_event(
    with _event_cv:
       _events.append(event)
       _event_cv.notify_all()
+
+
+def _current_run_number(rcli) -> Optional[int]:
+   if rcli is None:
+      return None
+   text = _read_text_key(rcli, "run_info:run_number", "").strip()
+   if text == "":
+      return None
+   try:
+      return int(float(text))
+   except Exception:
+      return None
+
+
+def _latest_run_number(rcli) -> Optional[int]:
+   if rcli is None:
+      return None
+   text = _read_text_key(rcli, "run_info:latest_run_number", "").strip()
+   if text == "":
+      return None
+   try:
+      return int(float(text))
+   except Exception:
+      return None
+
+
+def _monitoring_run_number(rcli, before_state: str, current_state: str) -> Optional[int]:
+   b = str(before_state or "")
+   c = str(current_state or "")
+   if b == "RUNNING" or c == "RUNNING":
+      latest = _latest_run_number(rcli)
+      if latest is not None:
+         return latest
+   return _current_run_number(rcli)
+
+
+def _begin_transition_watch(
+   mode: str,
+   run_number: Optional[int],
+   current_state: str,
+   trigger: str = "monitor-fallback",
+   command: str = "",
+):
+   global _transition_watch
+   _transition_watch = {
+      "mode": str(mode),
+      "run_number": run_number,
+      "last_state": str(current_state),
+      "last_change_ts": _now_ts(),
+      "started_ts": _now_ts(),
+      "trigger": str(trigger),
+      "command": str(command),
+   }
+
+
+def _arm_transition_watch_from_command(rcli, command: str):
+   cmd = str(command or "").strip().upper()
+   if cmd == "":
+      return
+
+   current_state = _merged_daq_state(rcli)
+   if cmd == "RUN":
+      _begin_transition_watch(
+         mode="start",
+         run_number=_current_run_number(rcli),
+         current_state=current_state,
+         trigger="command",
+         command=cmd,
+      )
+      return
+
+   if cmd in {"STOP", "RESET DEVICE", "END"}:
+      _begin_transition_watch(
+         mode="end",
+         run_number=_latest_run_number(rcli),
+         current_state=current_state,
+         trigger="command",
+         command=cmd,
+      )
+
+
+def _record_transition_watch_result(mode: str, run_number: Optional[int], final_state: str, timed_out: bool, detail: Dict[str, Any]):
+   now_ts = _now_ts()
+   if mode == "start":
+      if timed_out:
+         _record_anomaly(
+            event_ts_ms=now_ts,
+            anomaly_type="run_start_timeout",
+            severity="warning",
+            state=str(final_state),
+            run_number=run_number,
+            message=f"Run start sequence timed out before RUNNING (last_state={final_state})",
+            detail=detail,
+         )
+      else:
+         _record_state_transition(
+            event_ts_ms=now_ts,
+            transition_type="run_start",
+            from_state="IDLE",
+            to_state="RUNNING",
+            run_number=run_number,
+            message="Detected IDLE => RUNNING transition sequence",
+            detail=detail,
+         )
+      return
+
+   if mode == "end":
+      if timed_out:
+         _record_anomaly(
+            event_ts_ms=now_ts,
+            anomaly_type="run_end_timeout",
+            severity="warning",
+            state=str(final_state),
+            run_number=run_number,
+            message=f"Run end sequence timed out before IDLE (last_state={final_state})",
+            detail=detail,
+         )
+      else:
+         _record_state_transition(
+            event_ts_ms=now_ts,
+            transition_type="run_end",
+            from_state="RUNNING",
+            to_state="IDLE",
+            run_number=run_number,
+            message="Detected RUNNING => IDLE transition sequence",
+            detail=detail,
+         )
+
+
+def _update_transition_watch(current_state: str):
+   global _transition_watch
+
+   watch = _transition_watch
+   if watch is None:
+      return
+
+   now_ts = _now_ts()
+   prev_state = str(watch.get("last_state", ""))
+   state_now = str(current_state)
+   if state_now != prev_state:
+      watch["last_state"] = state_now
+      watch["last_change_ts"] = now_ts
+
+   mode = str(watch.get("mode", ""))
+   run_number = watch.get("run_number", None)
+   trigger = str(watch.get("trigger", ""))
+   command = str(watch.get("command", ""))
+   started_ts = int(watch.get("started_ts", now_ts))
+   last_change_ts = int(watch.get("last_change_ts", now_ts))
+   timeout_ms = int(max(1, _state_change_timeout_sec) * 1000)
+
+   if mode == "start" and state_now == "RUNNING":
+      _record_transition_watch_result(
+         mode="start",
+         run_number=run_number,
+         final_state=state_now,
+         timed_out=False,
+         detail={
+            "sequence": "idle_to_running",
+            "timeout_sec": _state_change_timeout_sec,
+            "elapsed_ms": now_ts - started_ts,
+            "trigger": trigger,
+            "command": command,
+         },
+      )
+      _transition_watch = None
+      return
+
+   if mode == "end" and state_now == "IDLE":
+      _record_transition_watch_result(
+         mode="end",
+         run_number=run_number,
+         final_state=state_now,
+         timed_out=False,
+         detail={
+            "sequence": "running_to_idle",
+            "timeout_sec": _state_change_timeout_sec,
+            "elapsed_ms": now_ts - started_ts,
+            "trigger": trigger,
+            "command": command,
+         },
+      )
+      _transition_watch = None
+      return
+
+   if now_ts - started_ts > timeout_ms:
+      _record_transition_watch_result(
+         mode=mode,
+         run_number=run_number,
+         final_state=state_now,
+         timed_out=True,
+         detail={
+            "sequence": "idle_to_running" if mode == "start" else "running_to_idle",
+            "timeout_sec": _state_change_timeout_sec,
+            "elapsed_ms": now_ts - started_ts,
+            "last_change_elapsed_ms": now_ts - last_change_ts,
+            "trigger": trigger,
+            "command": command,
+         },
+      )
+      _transition_watch = None
+
+
+def _state_log_enqueue(record: Dict[str, Any]):
+   with _state_log_cv:
+      if len(_state_log_queue) >= _state_log_queue.maxlen:
+         _state_log_queue.popleft()
+         _state_log_status["total_dropped"] = int(_state_log_status.get("total_dropped", 0)) + 1
+      _state_log_queue.append(record)
+      _state_log_status["pending_records"] = len(_state_log_queue)
+      _state_log_cv.notify_all()
+
+
+def _state_log_write_one(record: Dict[str, Any]):
+   record_kind = str(record.get("record_kind", ""))
+   event_ts_ms = int(record.get("event_ts_ms", _now_ts()))
+
+   if record_kind == "transition":
+      _state_log_repository.record_transition(
+         TransitionPayload(
+            event_ts_ms=event_ts_ms,
+            transition_type=str(record.get("transition_type", "state_transition")),
+            from_state=str(record.get("from_state", "")),
+            to_state=str(record.get("to_state", "")),
+            run_number=record.get("run_number", None),
+            source=str(record.get("source", "nestdaq-monitor")),
+            message=str(record.get("message", "")),
+            detail=dict(record.get("detail", {})),
+         )
+      )
+      return
+
+   if record_kind == "anomaly":
+      _state_log_repository.record_anomaly(
+         AnomalyPayload(
+            event_ts_ms=event_ts_ms,
+            anomaly_type=str(record.get("anomaly_type", "anomaly")),
+            severity=str(record.get("severity", "critical")),
+            state=str(record.get("state", "")),
+            run_number=record.get("run_number", None),
+            source=str(record.get("source", "nestdaq-monitor")),
+            message=str(record.get("message", "")),
+            detail=dict(record.get("detail", {})),
+         )
+      )
+
+
+def _state_log_set_error(err: str):
+   global _state_log_db_notified_unavailable
+   should_emit = False
+   with _state_log_lock:
+      _state_log_status["db_available"] = False
+      _state_log_status["last_error"] = err
+      _state_log_status["last_error_ts"] = _now_ts()
+      _state_log_status["pending_records"] = len(_state_log_queue)
+      if not _state_log_db_notified_unavailable:
+         _state_log_db_notified_unavailable = True
+         should_emit = True
+   if should_emit:
+      _emit_event(
+         event_type="state_log_db_unavailable",
+         severity="warning",
+         source="state-log-db",
+         state_before="",
+         state_after="",
+         action="write",
+         result=err[:200],
+      )
+
+
+def _state_log_set_recovered():
+   global _state_log_db_notified_unavailable
+   should_emit = False
+   with _state_log_lock:
+      _state_log_status["db_available"] = True
+      _state_log_status["last_error"] = ""
+      _state_log_status["pending_records"] = len(_state_log_queue)
+      if _state_log_db_notified_unavailable:
+         _state_log_db_notified_unavailable = False
+         should_emit = True
+   if should_emit:
+      _emit_event(
+         event_type="state_log_db_recovered",
+         severity="info",
+         source="state-log-db",
+         state_before="",
+         state_after="",
+         action="write",
+         result="success",
+      )
+
+
+def _state_log_writer_worker():
+   schema_ready = False
+   while True:
+      with _state_log_cv:
+         if len(_state_log_queue) == 0:
+            _state_log_cv.wait(timeout=1.0)
+            continue
+         record = dict(_state_log_queue[0])
+
+      try:
+         if not schema_ready:
+            _state_log_repository.check_schema_ready()
+            schema_ready = True
+
+         _state_log_write_one(record)
+
+         with _state_log_lock:
+            if len(_state_log_queue) > 0:
+               _state_log_queue.popleft()
+            _state_log_status["pending_records"] = len(_state_log_queue)
+            _state_log_status["total_written"] = int(_state_log_status.get("total_written", 0)) + 1
+            _state_log_status["last_write_ts"] = _now_ts()
+         _state_log_set_recovered()
+      except Exception as ex:
+         schema_ready = False
+         _state_log_set_error(str(ex))
+         wait_sec = _state_log_retry_sec if _state_log_retry_sec > 0 else 1.0
+         time.sleep(wait_sec)
+
+
+def _start_state_log_writer_if_needed():
+   global _state_log_writer_thread
+   if _state_log_writer_thread is None or not _state_log_writer_thread.is_alive():
+      _state_log_writer_thread = threading.Thread(target=_state_log_writer_worker, daemon=True)
+      _state_log_writer_thread.start()
+
+
+def _record_state_transition(
+   event_ts_ms: int,
+   transition_type: str,
+   from_state: str,
+   to_state: str,
+   run_number: Optional[int],
+   message: str,
+   detail: Dict[str, Any],
+):
+   _state_log_enqueue(
+      {
+         "record_kind": "transition",
+         "event_ts_ms": event_ts_ms,
+         "transition_type": transition_type,
+         "from_state": str(from_state),
+         "to_state": str(to_state),
+         "run_number": run_number,
+         "source": "nestdaq-monitor",
+         "message": message,
+         "detail": detail,
+      }
+   )
+
+
+def _record_anomaly(
+   event_ts_ms: int,
+   anomaly_type: str,
+   severity: str,
+   state: str,
+   run_number: Optional[int],
+   message: str,
+   detail: Dict[str, Any],
+):
+   _state_log_enqueue(
+      {
+         "record_kind": "anomaly",
+         "event_ts_ms": event_ts_ms,
+         "anomaly_type": anomaly_type,
+         "severity": severity,
+         "state": str(state),
+         "run_number": run_number,
+         "source": "nestdaq-monitor",
+         "message": message,
+         "detail": detail,
+      }
+   )
 
 
 def _decode_service_name(key: bytes) -> str:
@@ -392,6 +805,7 @@ def _publish_change_state(rcli, command: str):
       ensure_ascii=True,
    )
    rcli.publish("daqctl", payload)
+   _arm_transition_watch_from_command(rcli, command)
 
 
 def _wait_for_state_change(rcli, destination: str, timeout_sec: int) -> bool:
@@ -636,6 +1050,7 @@ def _monitor_once():
    global _last_summary
    global _last_recovery_ts
    global _run_was_active_since_idle
+   global _transition_watch
 
    before = _last_summary
    rcli = aProxy.instance()
@@ -657,7 +1072,103 @@ def _monitor_once():
    else:
       summary = _evaluate_summary(_collect_status(rcli))
 
+   before_state = str(before.get("state", ""))
    current_state = str(summary.get("state", ""))
+   run_number = _current_run_number(rcli)
+   monitoring_run_number = _monitoring_run_number(rcli, before_state, current_state)
+
+   # First, try to resolve an existing watch (success/timeout).
+   _update_transition_watch(current_state)
+
+   watch = _transition_watch
+   if watch is not None:
+      watch_mode = str(watch.get("mode", ""))
+      if watch_mode == "end" and current_state == "RUNNING":
+         # Recovery came back to RUNNING before reaching IDLE.
+         # Close stale end-watch path and record a new run_start immediately.
+         _transition_watch = None
+         _begin_transition_watch(
+            mode="start",
+            run_number=run_number,
+            current_state=current_state,
+         )
+         _update_transition_watch(current_state)
+
+   if _transition_watch is None:
+      if before_state == "IDLE" and current_state != "IDLE":
+         _begin_transition_watch(
+            mode="start",
+            run_number=run_number,
+            current_state=current_state,
+            trigger="monitor-fallback",
+            command="",
+         )
+         _update_transition_watch(current_state)
+      elif before_state == "RUNNING" and current_state != "RUNNING":
+         _begin_transition_watch(
+            mode="end",
+            run_number=_latest_run_number(rcli),
+            current_state=current_state,
+            trigger="monitor-fallback",
+            command="",
+         )
+         _update_transition_watch(current_state)
+      elif before_state not in {"", "RUNNING"} and current_state == "RUNNING":
+         # Fallback path for fast recovery transitions where IDLE phase is skipped in polling.
+         _begin_transition_watch(
+            mode="start",
+            run_number=run_number,
+            current_state=current_state,
+            trigger="monitor-fallback",
+            command="",
+         )
+         _update_transition_watch(current_state)
+
+   before_missing = before.get("missing_expected_services", [])
+   before_stale = before.get("stale_services", [])
+   before_overall = str(before.get("overall", ""))
+   restart_recovery_context = (
+      before_state not in {"", "IDLE", "RUNNING"}
+      or before_overall == "critical"
+      or len(before_missing) > 0
+      or len(before_stale) > 0
+   )
+   recovered_now = (
+      before_overall == "critical"
+      and str(summary.get("overall", "")) != "critical"
+   )
+   state_transitioned = before_state != current_state
+   if restart_recovery_context and current_state in {"IDLE", "RUNNING"} and (state_transitioned or recovered_now):
+      _record_anomaly(
+         event_ts_ms=_now_ts(),
+         anomaly_type="restart_from_intermediate_state",
+         severity="info",
+         state=current_state,
+         run_number=monitoring_run_number,
+         message=f"DAQ restart/recovery observed from intermediate state ({before_state} => {current_state})",
+         detail={
+            "before_state": before_state,
+            "after_state": current_state,
+            "before_overall": before_overall,
+            "missing_expected_services": before_missing,
+            "stale_services": before_stale,
+         },
+      )
+
+   if before.get("overall") != "critical" and summary.get("overall") == "critical":
+      _record_anomaly(
+         event_ts_ms=_now_ts(),
+         anomaly_type="health_critical",
+         severity="critical",
+         state=current_state,
+         run_number=monitoring_run_number,
+         message="Overall health became critical",
+         detail={
+            "missing_expected_services": summary.get("missing_expected_services", []),
+            "stale_services": summary.get("stale_services", []),
+         },
+      )
+
    if current_state == "RUNNING":
       _run_was_active_since_idle = True
    elif current_state == "IDLE":
@@ -697,6 +1208,15 @@ def _monitor_once():
       )
 
    if len(summary.get("stale_services", [])) > 0 and len(before.get("stale_services", [])) == 0:
+      _record_anomaly(
+         event_ts_ms=_now_ts(),
+         anomaly_type="service_stale",
+         severity="critical",
+         state=current_state,
+         run_number=monitoring_run_number,
+         message="Detected stale services",
+         detail={"stale_services": summary.get("stale_services", [])},
+      )
       _emit_event(
          event_type="service_stale_detected",
          severity="critical",
@@ -709,6 +1229,16 @@ def _monitor_once():
 
    # Expected services missing from redis status indicates process-level anomaly.
    if len(summary.get("missing_expected_services", [])) > 0 and len(before.get("missing_expected_services", [])) == 0:
+      missing_services = summary.get("missing_expected_services", [])
+      _record_anomaly(
+         event_ts_ms=_now_ts(),
+         anomaly_type="process_missing",
+         severity="critical",
+         state=current_state,
+         run_number=monitoring_run_number,
+         message="Detected missing expected services: " + ",".join([str(s) for s in missing_services]),
+         detail={"missing_expected_services": missing_services},
+      )
       _emit_event(
          event_type="process_missing_detected",
          severity="critical",
@@ -716,7 +1246,7 @@ def _monitor_once():
          state_before=str(before.get("state", "")),
          state_after=str(summary.get("state", "")),
          action="none",
-         result=",".join(summary.get("missing_expected_services", [])),
+         result=",".join([str(s) for s in missing_services]),
       )
 
    if _auto_recovery_enabled and summary.get("overall") == "critical":
@@ -802,7 +1332,28 @@ def _sse_data(event: Dict) -> str:
    return f"event: nestdaq\ndata: {payload}\n\n"
 
 
+def _state_log_select(sql_text: str, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
+   try:
+      ready, err = state_log_schema_ready()
+      if not ready:
+         return [], err
+      engine = get_state_log_engine()
+      with engine.connect() as conn:
+         rows = conn.execute(text(sql_text), params).mappings().all()
+      return [dict(r) for r in rows], ""
+   except Exception as ex:
+      return [], str(ex)
+
+
+def _refresh_state_log_runtime_meta():
+   cfg = state_log_runtime_config()
+   with _state_log_lock:
+      _state_log_status["backend"] = str(cfg.get("backend", "postgresql"))
+      _state_log_status["db_target"] = state_log_database_url()
+
+
 _load_monitor_config_from_settings()
+_start_state_log_writer_if_needed()
 _start_monitor_if_needed()
 
 @router.get('/')
@@ -818,6 +1369,46 @@ async def monitor_config_get():
       "message": "ok",
       "current": current,
       "defaults": dict(_monitor_config_defaults),
+      "settings_file": get_settings_file_path(),
+   }
+
+
+@router.get('/state-log/config/get')
+async def state_log_config_get():
+   _refresh_state_log_runtime_meta()
+   return {
+      "message": "ok",
+      "current": state_log_runtime_config(),
+      "defaults": state_log_default_config(),
+      "settings_file": get_settings_file_path(),
+   }
+
+
+@router.post('/state-log/config/set')
+async def state_log_config_set(payload: Dict):
+   global _state_log_repository
+   if not isinstance(payload, dict):
+      raise HTTPException(status_code=400, detail="payload must be an object")
+
+   current = state_log_runtime_config()
+   merged = dict(current)
+   merged.update(payload)
+   normalized = set_state_log_runtime_config(merged)
+   _state_log_repository = SQLAlchemyStateLogRepository()
+   _refresh_state_log_runtime_meta()
+
+   _emit_event(
+      event_type="state_log_config_updated",
+      severity="info",
+      source="api-request",
+      state_before="",
+      state_after="",
+      action="update_state_log_config",
+      result="success",
+   )
+   return {
+      "message": "ok",
+      "current": normalized,
       "settings_file": get_settings_file_path(),
    }
 
@@ -870,6 +1461,115 @@ async def health_summary():
 async def health_events(limit: int = Query(default=100, ge=1, le=1000)):
    with _event_cv:
       return {"events": list(_events)[-limit:]}
+
+
+@router.get('/state-log/status')
+async def state_log_status():
+   _refresh_state_log_runtime_meta()
+   schema_ready, schema_error = state_log_schema_ready()
+   with _state_log_lock:
+      status = dict(_state_log_status)
+      status["pending_records"] = len(_state_log_queue)
+      status["queue_max"] = int(_state_log_queue_max)
+      status["retry_sec"] = float(_state_log_retry_sec)
+      status["schema_ready"] = bool(schema_ready)
+      status["migration_required"] = not schema_ready
+      status["schema_error"] = schema_error
+   if schema_ready:
+      message = "ok"
+   elif schema_error.startswith("missing tables:"):
+      message = "migration_required"
+   else:
+      message = "db_unavailable"
+   return {"message": message, "status": status}
+
+
+@router.get('/state-log/transitions')
+async def state_log_transitions(
+   limit: int = Query(default=200, ge=1, le=5000),
+   offset: int = Query(default=0, ge=0),
+   from_ts_ms: int = Query(default=0, ge=0),
+   to_ts_ms: int = Query(default=4102444800000, ge=0),
+   run_number: Optional[int] = Query(default=None),
+   transition_type: str = Query(default=""),
+):
+   where = ["event_ts_ms >= :from_ts_ms", "event_ts_ms <= :to_ts_ms"]
+   params: Dict[str, Any] = {"from_ts_ms": int(from_ts_ms), "to_ts_ms": int(to_ts_ms)}
+   if run_number is not None:
+      where.append("run_number = :run_number")
+      params["run_number"] = int(run_number)
+   if str(transition_type).strip() != "":
+      where.append("transition_type = :transition_type")
+      params["transition_type"] = str(transition_type).strip()
+   params["limit"] = int(limit)
+   params["offset"] = int(offset)
+   sql_text = (
+      "SELECT * FROM state_transitions WHERE "
+      + " AND ".join(where)
+      + " ORDER BY event_ts_ms DESC LIMIT :limit OFFSET :offset"
+   )
+   rows, err = _state_log_select(sql_text, params)
+   return {"message": "ok" if err == "" else "db_unavailable", "error": err, "items": rows}
+
+
+@router.get('/state-log/anomalies')
+async def state_log_anomalies(
+   limit: int = Query(default=200, ge=1, le=5000),
+   offset: int = Query(default=0, ge=0),
+   from_ts_ms: int = Query(default=0, ge=0),
+   to_ts_ms: int = Query(default=4102444800000, ge=0),
+   run_number: Optional[int] = Query(default=None),
+   anomaly_type: str = Query(default=""),
+   severity: str = Query(default=""),
+):
+   where = ["event_ts_ms >= :from_ts_ms", "event_ts_ms <= :to_ts_ms"]
+   params: Dict[str, Any] = {"from_ts_ms": int(from_ts_ms), "to_ts_ms": int(to_ts_ms)}
+   if run_number is not None:
+      where.append("run_number = :run_number")
+      params["run_number"] = int(run_number)
+   if str(anomaly_type).strip() != "":
+      where.append("anomaly_type = :anomaly_type")
+      params["anomaly_type"] = str(anomaly_type).strip()
+   if str(severity).strip() != "":
+      where.append("severity = :severity")
+      params["severity"] = str(severity).strip()
+   params["limit"] = int(limit)
+   params["offset"] = int(offset)
+   sql_text = (
+      "SELECT * FROM anomaly_events WHERE "
+      + " AND ".join(where)
+      + " ORDER BY event_ts_ms DESC LIMIT :limit OFFSET :offset"
+   )
+   rows, err = _state_log_select(sql_text, params)
+   return {"message": "ok" if err == "" else "db_unavailable", "error": err, "items": rows}
+
+
+@router.get('/state-log/runs')
+async def state_log_runs(
+   limit: int = Query(default=200, ge=1, le=5000),
+   offset: int = Query(default=0, ge=0),
+   from_ts_ms: int = Query(default=0, ge=0),
+   to_ts_ms: int = Query(default=4102444800000, ge=0),
+   run_number: Optional[int] = Query(default=None),
+   status: str = Query(default=""),
+):
+   where = ["start_ts_ms >= :from_ts_ms", "start_ts_ms <= :to_ts_ms"]
+   params: Dict[str, Any] = {"from_ts_ms": int(from_ts_ms), "to_ts_ms": int(to_ts_ms)}
+   if run_number is not None:
+      where.append("run_number = :run_number")
+      params["run_number"] = int(run_number)
+   if str(status).strip() != "":
+      where.append("status = :status")
+      params["status"] = str(status).strip()
+   params["limit"] = int(limit)
+   params["offset"] = int(offset)
+   sql_text = (
+      "SELECT * FROM runs WHERE "
+      + " AND ".join(where)
+      + " ORDER BY start_ts_ms DESC LIMIT :limit OFFSET :offset"
+   )
+   rows, err = _state_log_select(sql_text, params)
+   return {"message": "ok" if err == "" else "db_unavailable", "error": err, "items": rows}
 
 
 @router.get('/health/events/stream')

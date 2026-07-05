@@ -1,3 +1,4 @@
-__pycache__/
+local_settings.json
 dump.rdb
+__pycache__
 *.log
